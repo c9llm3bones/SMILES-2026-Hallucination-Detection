@@ -29,7 +29,7 @@ from sklearn.model_selection import StratifiedKFold
 from sklearn.preprocessing import StandardScaler
 
 # Block A boundary: 5 layers × 896-d = 4480 (must match aggregation.py)
-_A_END = 5 * 896
+_A_END = 25 * 896
 
 _C_GRID = [0.01, 0.05, 0.1, 0.5, 1.0]
 
