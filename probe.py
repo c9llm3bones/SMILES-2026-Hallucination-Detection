@@ -1,24 +1,20 @@
 """
-probe.py — Hallucination probe: stacking ensemble of four specialists.
+probe.py — Hallucination probe: PCA + LogisticRegression with C-tuning.
 
-Feature vector layout expected from aggregation.py (USE_GEOMETRIC=True):
-  Block A  [0    :4480]  semantic  — mean-pooled hidden states, 5 layers × 896
-  Block B  [4480 :4504]  drift     — inter-layer cosine similarities (24)
-  Block C  [4504 :4529]  norms     — layer-wise mean L2 norms (25)
+Feature vector layout expected from aggregation.py:
+  Block A  [0    :4480]  semantic  — last real token, 5 layers × 896-d
+  Block BC [4480 :4529]  geometric — inter-layer cosine (24) + layer norms (25)
   Block D  [4529 :4534]  scalars   — norm_mean, norm_cv, norm_ratio, min_cos, n_real
 
-Architecture (USE_GEOMETRIC=True):
-  Specialist A   — PCA(64) on Block A       → LogisticRegression
-  Specialist BC  — StandardScaler on B+C    → LogisticRegression
-  Specialist D   — StandardScaler on Block D → LogisticRegression
-  Specialist ALL — PCA(128) on all blocks   → LogisticRegression (C=0.1)
+Pipeline (USE_GEOMETRIC=True):
+  Block A  → StandardScaler → PCA(n_components=128)  ]
+  Block BC → StandardScaler                           ] → concatenate → LogisticRegression(C=C*)
+  Block D  → StandardScaler                           ]
 
-  Training:  5-fold OOF produces (N, 4) meta-features for the meta-learner.
-             All specialists are then retrained on the full training set.
-  Inference: specialists → 4 probabilities → meta LogisticRegression → label.
+  C* is selected from {0.01, 0.05, 0.1, 0.5, 1.0} by internal 3-fold CV (AUROC).
 
 Fallback (USE_GEOMETRIC=False, feature_dim=4480):
-  PCA(64) on Block A → LogisticRegression.
+  Block A → StandardScaler → PCA(64) → LogisticRegression(C=C*)
 """
 
 from __future__ import annotations
@@ -28,171 +24,88 @@ import torch
 import torch.nn as nn
 from sklearn.decomposition import PCA
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import f1_score
+from sklearn.metrics import f1_score, roc_auc_score
 from sklearn.model_selection import StratifiedKFold
 from sklearn.preprocessing import StandardScaler
 
-# ── Block boundaries (must match aggregation.py) ────────────────────────────
-_A_DIM  = 5 * 896   # 4480  Block A
-_B_DIM  = 24        #        Block B
-_C_DIM  = 25        #        Block C
-_D_DIM  = 5         #        Block D
+# Block A boundary: 5 layers × 896-d = 4480 (must match aggregation.py)
+_A_END = 5 * 896
 
-_A_END  = _A_DIM                        # 4480
-_BC_END = _A_END  + _B_DIM + _C_DIM    # 4529
-_D_END  = _BC_END + _D_DIM             # 4534
-
-_N_META = 4         # number of specialist outputs fed to meta-learner
+_C_GRID = [0.01, 0.05, 0.1, 0.5, 1.0]
 
 
-def _make_lr(C: float = 1.0) -> LogisticRegression:
+def _make_lr(C: float) -> LogisticRegression:
     return LogisticRegression(C=C, max_iter=2000, solver="lbfgs", random_state=42)
 
 
 class HallucinationProbe(nn.Module):
-    """Stacking ensemble for hallucination detection from hidden-state features."""
+    """Binary probe: per-block scaling + PCA on Block A + LogReg with C-tuning."""
 
     def __init__(self) -> None:
         super().__init__()
         self._threshold: float = 0.5
-        self._mode: str = "uninit"   # "stacking" | "fallback"
+        self._has_geo: bool = False
 
-        # ── Preprocessors (fitted in fit()) ─────────────────────────────────
-        self._ss_a    = StandardScaler()
-        self._pca_a   = PCA(n_components=64,  random_state=42)
-        self._ss_bc   = StandardScaler()
-        self._ss_d    = StandardScaler()
-        self._ss_all  = StandardScaler()
-        self._pca_all = PCA(n_components=128, random_state=42)
+        self._ss_a   = StandardScaler()
+        self._pca_a  = PCA(n_components=128, random_state=42)
+        self._ss_geo = StandardScaler()   # for Block BC + D concatenated
+        self._model  = _make_lr(0.1)
 
-        # ── Specialists (fitted on full training set after OOF) ──────────────
-        self._spec_a   = _make_lr(C=1.0)
-        self._spec_bc  = _make_lr(C=1.0)
-        self._spec_d   = _make_lr(C=1.0)
-        self._spec_all = _make_lr(C=0.1)
+    # ── Internal helpers ────────────────────────────────────────────────────
 
-        # ── Meta-learner (fitted on OOF meta-features) ───────────────────────
-        self._meta = _make_lr(C=1.0)
+    def _prepare(self, X: np.ndarray, fit: bool = False) -> np.ndarray:
+        """Scale + PCA each block, return concatenated features."""
+        a = X[:, :_A_END]
 
-        # ── Fallback for USE_GEOMETRIC=False ─────────────────────────────────
-        self._ss_fb  = StandardScaler()
-        self._pca_fb = PCA(n_components=64, random_state=42)
-        self._fb     = _make_lr(C=1.0)
-
-    # ── Internal helpers ─────────────────────────────────────────────────────
-
-    @staticmethod
-    def _has_geo(X: np.ndarray) -> bool:
-        return X.shape[1] > _A_END
-
-    @staticmethod
-    def _split(X: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Return (block_a, block_bc, block_d) views."""
-        return X[:, :_A_END], X[:, _A_END:_BC_END], X[:, _BC_END:_D_END]
-
-    def _transform(self, X: np.ndarray, fit: bool = False) -> tuple:
-        """Scale + PCA each block; optionally fit the transformers."""
-        a, bc, d = self._split(X)
+        n_comp = min(128, X.shape[0] - 1, _A_END)
         if fit:
-            a_t   = self._pca_a.fit_transform(self._ss_a.fit_transform(a))
-            bc_t  = self._ss_bc.fit_transform(bc)
-            d_t   = self._ss_d.fit_transform(d)
-            all_t = self._pca_all.fit_transform(self._ss_all.fit_transform(X))
+            self._pca_a = PCA(n_components=n_comp, random_state=42)
+            a_t = self._pca_a.fit_transform(self._ss_a.fit_transform(a))
         else:
-            a_t   = self._pca_a.transform(self._ss_a.transform(a))
-            bc_t  = self._ss_bc.transform(bc)
-            d_t   = self._ss_d.transform(d)
-            all_t = self._pca_all.transform(self._ss_all.transform(X))
-        return a_t, bc_t, d_t, all_t
+            a_t = self._pca_a.transform(self._ss_a.transform(a))
 
-    def _meta_features(
-        self,
-        a_t: np.ndarray,
-        bc_t: np.ndarray,
-        d_t: np.ndarray,
-        all_t: np.ndarray,
-        specs: tuple,
-    ) -> np.ndarray:
-        """Concatenate specialist probabilities into meta-feature matrix."""
-        sa, sbc, sd, sall = specs
-        return np.column_stack([
-            sa.predict_proba(a_t)[:, 1],
-            sbc.predict_proba(bc_t)[:, 1],
-            sd.predict_proba(d_t)[:, 1],
-            sall.predict_proba(all_t)[:, 1],
-        ])
+        if not self._has_geo or X.shape[1] <= _A_END:
+            return a_t
 
-    # ── Public interface ─────────────────────────────────────────────────────
+        geo = X[:, _A_END:]   # Block BC + D = 54-d
+        if fit:
+            geo_t = self._ss_geo.fit_transform(geo)
+        else:
+            geo_t = self._ss_geo.transform(geo)
+
+        return np.hstack([a_t, geo_t])
+
+    def _tune_c(self, X: np.ndarray, y: np.ndarray) -> float:
+        """Pick C that maximises mean AUROC on internal 3-fold CV."""
+        skf = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
+        best_c, best_auc = _C_GRID[0], -1.0
+        for c in _C_GRID:
+            aucs = []
+            for tr, vl in skf.split(X, y):
+                m = _make_lr(c)
+                m.fit(X[tr], y[tr])
+                try:
+                    aucs.append(roc_auc_score(y[vl], m.predict_proba(X[vl])[:, 1]))
+                except ValueError:
+                    aucs.append(0.5)
+            mean_auc = float(np.mean(aucs))
+            if mean_auc > best_auc:
+                best_auc, best_c = mean_auc, c
+        return best_c
+
+    # ── Public interface ────────────────────────────────────────────────────
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError("Call predict() or predict_proba() directly.")
+        raise NotImplementedError("Use predict() or predict_proba() directly.")
 
     def fit(self, X: np.ndarray, y: np.ndarray) -> "HallucinationProbe":
-        """Train the stacking ensemble on labelled feature vectors."""
-        if not self._has_geo(X):
-            self._fit_fallback(X, y)
-            return self
+        self._has_geo = X.shape[1] > _A_END
 
-        # ── Step 1: fit global preprocessors ────────────────────────────────
-        self._transform(X, fit=True)
-
-        # ── Step 2: generate OOF meta-features via internal 5-fold CV ───────
-        n = len(y)
-        oof_meta = np.zeros((n, _N_META))
-        skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-
-        for tr_idx, val_idx in skf.split(np.arange(n), y):
-            X_tr, X_val = X[tr_idx], X[val_idx]
-            y_tr = y[tr_idx]
-
-            # Local preprocessors for this fold
-            a_tr, bc_tr, d_tr = self._split(X_tr)
-            a_vl, bc_vl, d_vl = self._split(X_val)
-
-            n_comp_a   = min(64,  len(y_tr) - 1, _A_DIM)
-            n_comp_all = min(128, len(y_tr) - 1, X_tr.shape[1])
-
-            ss_a, pca_a  = StandardScaler(), PCA(n_comp_a,   random_state=42)
-            ss_bc        = StandardScaler()
-            ss_d         = StandardScaler()
-            ss_all, pca_all = StandardScaler(), PCA(n_comp_all, random_state=42)
-
-            a_tr_t   = pca_a.fit_transform(ss_a.fit_transform(a_tr))
-            a_vl_t   = pca_a.transform(ss_a.transform(a_vl))
-            bc_tr_t  = ss_bc.fit_transform(bc_tr);  bc_vl_t  = ss_bc.transform(bc_vl)
-            d_tr_t   = ss_d.fit_transform(d_tr);    d_vl_t   = ss_d.transform(d_vl)
-            all_tr_t = pca_all.fit_transform(ss_all.fit_transform(X_tr))
-            all_vl_t = pca_all.transform(ss_all.transform(X_val))
-
-            # Fit fold specialists
-            sa   = _make_lr(C=1.0).fit(a_tr_t,   y_tr)
-            sbc  = _make_lr(C=1.0).fit(bc_tr_t,  y_tr)
-            sd   = _make_lr(C=1.0).fit(d_tr_t,   y_tr)
-            sall = _make_lr(C=0.1).fit(all_tr_t, y_tr)
-
-            oof_meta[val_idx] = self._meta_features(
-                a_vl_t, bc_vl_t, d_vl_t, all_vl_t, (sa, sbc, sd, sall)
-            )
-
-        # ── Step 3: train meta-learner on OOF meta-features ─────────────────
-        self._meta.fit(oof_meta, y)
-
-        # ── Step 4: retrain specialists on full training set ─────────────────
-        a_t, bc_t, d_t, all_t = self._transform(X, fit=False)
-        self._spec_a.fit(a_t,   y)
-        self._spec_bc.fit(bc_t, y)
-        self._spec_d.fit(d_t,   y)
-        self._spec_all.fit(all_t, y)
-
-        self._mode = "stacking"
+        X_t = self._prepare(X, fit=True)
+        best_c = self._tune_c(X_t, y)
+        self._model = _make_lr(best_c)
+        self._model.fit(X_t, y)
         return self
-
-    def _fit_fallback(self, X: np.ndarray, y: np.ndarray) -> None:
-        n_comp = min(64, X.shape[0] - 1, X.shape[1])
-        self._pca_fb = PCA(n_components=n_comp, random_state=42)
-        X_t = self._pca_fb.fit_transform(self._ss_fb.fit_transform(X))
-        self._fb.fit(X_t, y)
-        self._mode = "fallback"
 
     def fit_hyperparameters(
         self, X_val: np.ndarray, y_val: np.ndarray
@@ -209,15 +122,8 @@ class HallucinationProbe(nn.Module):
         return self
 
     def predict_proba(self, X: np.ndarray) -> np.ndarray:
-        """Return (n_samples, 2) probability array."""
-        if self._mode == "fallback":
-            X_t = self._pca_fb.transform(self._ss_fb.transform(X))
-            return self._fb.predict_proba(X_t)
-
-        a_t, bc_t, d_t, all_t = self._transform(X, fit=False)
-        specs = (self._spec_a, self._spec_bc, self._spec_d, self._spec_all)
-        meta_X = self._meta_features(a_t, bc_t, d_t, all_t, specs)
-        return self._meta.predict_proba(meta_X)
+        """Return (n_samples, 2) class probability array."""
+        return self._model.predict_proba(self._prepare(X, fit=False))
 
     def predict(self, X: np.ndarray) -> np.ndarray:
         """Return binary labels using the tuned threshold."""

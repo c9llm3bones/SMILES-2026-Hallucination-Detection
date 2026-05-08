@@ -26,7 +26,12 @@ def aggregate(
     hidden_states: torch.Tensor,
     attention_mask: torch.Tensor,
 ) -> torch.Tensor:
-    """Block A: mean pool of real tokens across selected transformer layers.
+    """Block A: last real token across selected transformer layers.
+
+    Using the last real token rather than mean pool because:
+    - In a decoder-only model the last token attends to the full context
+    - ~60-70% of tokens belong to the (identical) prompt — mean pool is noisy
+    - The final token state captures the model's committed conclusion
 
     Args:
         hidden_states:  (n_layers, seq_len, hidden_dim)
@@ -35,11 +40,11 @@ def aggregate(
     Returns:
         (len(_SELECTED_LAYERS) * hidden_dim,) = (4480,)
     """
-    real_mask = attention_mask.bool()
+    real_positions = attention_mask.nonzero(as_tuple=False)
+    last_pos = int(real_positions[-1].item())
     parts = []
     for layer_idx in _SELECTED_LAYERS:
-        layer_repr = hidden_states[layer_idx][real_mask].mean(dim=0)  # (896,)
-        parts.append(layer_repr)
+        parts.append(hidden_states[layer_idx][last_pos])  # (896,)
     return torch.cat(parts)  # (4480,)
 
 
@@ -129,4 +134,3 @@ def aggregation_and_feature_extraction(
         return torch.cat([agg_features, geo_features], dim=0)
 
     return agg_features
-
