@@ -1,92 +1,107 @@
 """
-aggregation.py — Token aggregation strategy and feature extraction
-               (student-implemented).
+aggregation.py — Token aggregation strategy and feature extraction.
 
-Converts per-token, per-layer hidden states from the extraction loop in
-``solution.py`` into flat feature vectors for the probe classifier.
+Feature vector layout (USE_GEOMETRIC=True):
+  Block A  [0        : 4480]  — mean pool of real tokens across 5 selected layers
+  Block B  [4480     : 4504]  — inter-layer cosine similarity (24 transitions)
+  Block C  [4504     : 4529]  — layer-wise mean L2 norm (25 layers)
+  Block D  [4529     : 4534]  — scalar geometric features (5 values)
+  Total: 4534-d vector
 
-Two stages can be customised independently:
-
-  1. ``aggregate`` — select layers and token positions, pool into a vector.
-  2. ``extract_geometric_features`` — optional hand-crafted features
-     (enabled by setting ``USE_GEOMETRIC = True`` in ``solution.py``).
-
-Both stages are combined by ``aggregation_and_feature_extraction``, the
-single entry point called from the notebook.
+With USE_GEOMETRIC=False only Block A (4480-d) is returned.
 """
 
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
+
+# Transformer layer indices to use for Block A.
+# Index 0 = token embeddings; 1-24 = transformer layers 1-24.
+# Middle-to-late layers carry the most factual/hallucination signal.
+_SELECTED_LAYERS = [8, 12, 16, 20, 24]
 
 
 def aggregate(
     hidden_states: torch.Tensor,
     attention_mask: torch.Tensor,
 ) -> torch.Tensor:
-    """Convert per-token hidden states into a single feature vector.
+    """Block A: mean pool of real tokens across selected transformer layers.
 
     Args:
-        hidden_states:  Tensor of shape ``(n_layers, seq_len, hidden_dim)``.
-                        Layer index 0 is the token embedding; index -1 is the
-                        final transformer layer.
-        attention_mask: 1-D tensor of shape ``(seq_len,)`` with 1 for real
-                        tokens and 0 for padding.
+        hidden_states:  (n_layers, seq_len, hidden_dim)
+        attention_mask: (seq_len,) — 1 for real tokens, 0 for padding.
 
     Returns:
-        A 1-D feature tensor of shape ``(hidden_dim,)`` or
-        ``(k * hidden_dim,)`` if multiple layers are concatenated.
-
-    Student task:
-        Replace or extend the skeleton below with alternative layer selection,
-        token pooling (mean, max, weighted), or multi-layer fusion strategies.
+        (len(_SELECTED_LAYERS) * hidden_dim,) = (4480,)
     """
-    # ------------------------------------------------------------------
-    # STUDENT: Replace or extend the aggregation below.
-    # ------------------------------------------------------------------
-
-    # Default: last real token of the final transformer layer.
-    layer = hidden_states[-1]          # (seq_len, hidden_dim)
-
-    # Find the index of the last real (non-padding) token.
-    real_positions = attention_mask.nonzero(as_tuple=False)  # (n_real, 1)
-    last_pos = int(real_positions[-1].item())                 # scalar index
-
-    feature = layer[last_pos]          # (hidden_dim,)
-
-    return feature
-    # ------------------------------------------------------------------
+    real_mask = attention_mask.bool()
+    parts = []
+    for layer_idx in _SELECTED_LAYERS:
+        layer_repr = hidden_states[layer_idx][real_mask].mean(dim=0)  # (896,)
+        parts.append(layer_repr)
+    return torch.cat(parts)  # (4480,)
 
 
 def extract_geometric_features(
     hidden_states: torch.Tensor,
     attention_mask: torch.Tensor,
 ) -> torch.Tensor:
-    """Extract hand-crafted geometric / statistical features from hidden states.
+    """Blocks B, C, D: geometric and statistical features of hidden states.
 
-    Called only when ``USE_GEOMETRIC = True`` in ``solution.ipynb``.  The
-    returned tensor is concatenated with the output of ``aggregate``.
+    Block B (24d): cosine similarity between consecutive layer representations.
+        Low cosine = large representational shift at that layer boundary.
+
+    Block C (25d): mean L2 norm of real-token hidden states per layer.
+        Norms tend to grow through the network; degenerate outputs show
+        anomalous growth patterns.
+
+    Block D (5d): scalar summary statistics of the last-layer activations.
+        norm_mean  — mean token norm in last layer
+        norm_cv    — coefficient of variation (std/mean) of token norms;
+                     low CV signals repetitive/degenerate generation
+        norm_ratio — last-layer mean norm / first-transformer-layer mean norm
+        min_cos    — minimum inter-layer cosine (= point of max drift)
+        n_real     — number of real (non-padding) tokens (length proxy)
 
     Args:
-        hidden_states:  Tensor of shape ``(n_layers, seq_len, hidden_dim)``.
-        attention_mask: 1-D tensor of shape ``(seq_len,)`` with 1 for real
-                        tokens and 0 for padding.
+        hidden_states:  (n_layers, seq_len, hidden_dim)
+        attention_mask: (seq_len,)
 
     Returns:
-        A 1-D float tensor of shape ``(n_geometric_features,)``.  The length
-        must be the same for every sample.
-
-    Student task:
-        Replace the stub below.  Possible features: layer-wise activation
-        norms, inter-layer cosine similarity (representation drift), or
-        sequence length.
+        (24 + 25 + 5,) = (54,)
     """
-    # ------------------------------------------------------------------
-    # STUDENT: Replace or extend the geometric feature extraction below.
-    # ------------------------------------------------------------------
+    real_mask = attention_mask.bool()
+    n_layers = hidden_states.shape[0]  # 25 for Qwen2.5-0.5B
 
-    # Placeholder: returns an empty tensor (no geometric features).
-    return torch.zeros(0)
+    # Block B: inter-layer cosine similarity (24 values)
+    block_b: list[float] = []
+    for l in range(n_layers - 1):
+        h_l  = hidden_states[l][real_mask].mean(0)      # (hidden_dim,)
+        h_l1 = hidden_states[l + 1][real_mask].mean(0)  # (hidden_dim,)
+        cos  = F.cosine_similarity(h_l.unsqueeze(0), h_l1.unsqueeze(0)).item()
+        block_b.append(cos)
+
+    # Block C: layer-wise mean L2 norm (25 values)
+    block_c: list[float] = [
+        hidden_states[l][real_mask].norm(dim=-1).mean().item()
+        for l in range(n_layers)
+    ]
+
+    # Block D: scalars from last layer (5 values)
+    last        = hidden_states[-1][real_mask]            # (n_real, hidden_dim)
+    token_norms = last.norm(dim=-1)                       # (n_real,)
+
+    norm_mean  = token_norms.mean().item()
+    norm_cv    = (token_norms.std() / (token_norms.mean() + 1e-8)).item()
+    first_norm = hidden_states[1][real_mask].norm(dim=-1).mean().item()
+    norm_ratio = norm_mean / (first_norm + 1e-8)
+    min_cos    = float(min(block_b))
+    n_real     = float(real_mask.sum().item())
+
+    block_d = [norm_mean, norm_cv, norm_ratio, min_cos, n_real]
+
+    return torch.tensor(block_b + block_c + block_d, dtype=torch.float32)
 
 
 def aggregation_and_feature_extraction(
@@ -94,26 +109,17 @@ def aggregation_and_feature_extraction(
     attention_mask: torch.Tensor,
     use_geometric: bool = False,
 ) -> torch.Tensor:
-    """Aggregate hidden states and optionally append geometric features.
-
-    Main entry point called from ``solution.ipynb`` for each sample.
-    Concatenates the output of ``aggregate`` with that of
-    ``extract_geometric_features`` when ``use_geometric=True``.
+    """Combine Block A with optional geometric features (Blocks B, C, D).
 
     Args:
-        hidden_states:  Tensor of shape ``(n_layers, seq_len, hidden_dim)``
-                        for a single sample.
-        attention_mask: 1-D tensor of shape ``(seq_len,)`` with 1 for real
-                        tokens and 0 for padding.
-        use_geometric:  Whether to append geometric features.  Controlled by
-                        the ``USE_GEOMETRIC`` flag in ``solution.ipynb``.
+        hidden_states:  (n_layers, seq_len, hidden_dim)
+        attention_mask: (seq_len,)
+        use_geometric:  If True, append Blocks B+C+D to Block A.
 
     Returns:
-        A 1-D float tensor of shape ``(feature_dim,)`` where
-        ``feature_dim = hidden_dim`` (or larger for multi-layer or geometric
-        concatenations).
+        (4480,) when use_geometric=False, (4534,) when True.
     """
-    agg_features = aggregate(hidden_states, attention_mask)  # (feature_dim,)
+    agg_features = aggregate(hidden_states, attention_mask)
 
     if use_geometric:
         geo_features = extract_geometric_features(hidden_states, attention_mask)
