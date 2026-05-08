@@ -18,8 +18,9 @@ import torch.nn.functional as F
 
 # Transformer layer indices to use for Block A.
 # Index 0 = token embeddings; 1-24 = transformer layers 1-24.
-# Middle-to-late layers carry the most factual/hallucination signal.
-_SELECTED_LAYERS = [8, 12, 16, 20, 24]
+# SEP paper: 5 consecutive layers > spread-out; later layers capture hallucination better.
+# SAPLMA: layer ~20 optimal for factuality in comparable models.
+_SELECTED_LAYERS = [20, 21, 22, 23, 24]
 
 
 def aggregate(
