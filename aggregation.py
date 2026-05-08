@@ -18,9 +18,9 @@ import torch.nn.functional as F
 
 # Transformer layer indices to use for Block A.
 # Index 0 = token embeddings; 1-24 = transformer layers 1-24.
-# SEP paper: 5 consecutive layers > spread-out; later layers capture hallucination better.
-# SAPLMA: layer ~20 optimal for factuality in comparable models.
-_SELECTED_LAYERS = [20, 21, 22, 23, 24]
+# Using all layers: PCA in probe.py finds the most discriminative directions
+# across the full depth trajectory without manual layer selection bias.
+_SELECTED_LAYERS = list(range(25))  # all 25 layers → 25*896 = 22400-d, PCA to 128
 
 
 def aggregate(
@@ -135,3 +135,4 @@ def aggregation_and_feature_extraction(
         return torch.cat([agg_features, geo_features], dim=0)
 
     return agg_features
+
