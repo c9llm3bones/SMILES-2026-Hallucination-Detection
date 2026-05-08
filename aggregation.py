@@ -119,6 +119,9 @@ def aggregation_and_feature_extraction(
     Returns:
         (4480,) when use_geometric=False, (4534,) when True.
     """
+    hidden_states  = hidden_states.cpu()
+    attention_mask = attention_mask.cpu()
+
     agg_features = aggregate(hidden_states, attention_mask)
 
     if use_geometric:
@@ -126,3 +129,4 @@ def aggregation_and_feature_extraction(
         return torch.cat([agg_features, geo_features], dim=0)
 
     return agg_features
+
