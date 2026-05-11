@@ -21,7 +21,7 @@ import torch
 
 # Mid-layer indices (0 = embeddings, 1-24 = transformer layers for Qwen2.5-0.5B).
 _MAX_POOL_LAYERS  = [12, 13]
-_MEAN_POOL_LAYERS = [13, 14, 15]
+_MEAN_POOL_LAYERS = [14, 15]
 
 # ---------------------------------------------------------------------------
 # Pre-compute prompt token lengths at module import time.

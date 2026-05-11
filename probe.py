@@ -19,7 +19,7 @@ from sklearn.model_selection import StratifiedKFold
 from sklearn.preprocessing import StandardScaler
 
 _N_BOOTSTRAP = 30
-_C_GRID      = [0.003, 0.005, 0.01, 0.05]
+_C_GRID      = [0.001, 0.002, 0.003, 0.005]
 
 
 def _make_lr(C: float) -> LogisticRegression:
