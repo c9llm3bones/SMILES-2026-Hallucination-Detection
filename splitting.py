@@ -1,20 +1,20 @@
 """
-splitting.py — Train / validation / test split strategy.
+splitting.py — RepeatedStratifiedKFold (5 splits × 5 repeats = 25 folds).
 
-Uses StratifiedKFold(n_splits=5) to maximise use of the 689-sample dataset.
-Each fold preserves class balance in every subset.
+25-fold repeated CV gives a stable accuracy estimate that is independent of any
+single lucky seed — a key advantage over single-split or plain 5-fold evaluation.
 
-Split sizes (approximate, for n=689, 70/30 imbalance):
-  train : ~440 samples (64%)
-  val   : ~110 samples (16%)
-  test  : ~138 samples (20%)
+Split sizes (approximate, for n=689):
+  test  : ~138 samples (20 %, 1/5)
+  val   : ~83  samples (15 % of remaining ~551)
+  train : ~468 samples
 """
 
 from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import StratifiedKFold, train_test_split
+from sklearn.model_selection import RepeatedStratifiedKFold, train_test_split
 
 
 def split_data(
@@ -24,28 +24,25 @@ def split_data(
     val_size: float = 0.15,
     random_state: int = 42,
 ) -> list[tuple[np.ndarray, np.ndarray | None, np.ndarray]]:
-    """5-fold stratified split returning (idx_train, idx_val, idx_test) tuples.
-
-    The outer split (KFold) carves out the test set; the remaining samples are
-    further split into train and val for threshold tuning.
+    """25-fold repeated stratified split returning (idx_train, idx_val, idx_test).
 
     Args:
         y:            Label array of shape (N,).
         df:           Unused; kept for interface compatibility.
-        test_size:    Approximate fraction for the test set per fold (~0.20
-                      when n_splits=5, regardless of this parameter).
+        test_size:    Ignored (test size is fixed at 1/n_splits ≈ 20 %).
         val_size:     Fraction of non-test samples reserved for validation.
-        random_state: Random seed.
+        random_state: Random seed passed to RepeatedStratifiedKFold.
 
     Returns:
-        List of 5 (idx_train, idx_val, idx_test) tuples.
+        List of 25 (idx_train, idx_val, idx_test) tuples.
     """
-    idx = np.arange(len(y))
-    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=random_state)
+    idx  = np.arange(len(y))
+    rskf = RepeatedStratifiedKFold(
+        n_splits=5, n_repeats=5, random_state=random_state
+    )
     splits = []
 
-    for train_val_idx, test_idx in skf.split(idx, y):
-        # val_fraction relative to the train+val pool
+    for train_val_idx, test_idx in rskf.split(idx, y):
         relative_val = val_size / (1.0 - 1.0 / 5)
         train_idx, val_idx = train_test_split(
             train_val_idx,

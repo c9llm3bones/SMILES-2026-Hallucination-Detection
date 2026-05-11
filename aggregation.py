@@ -1,138 +1,154 @@
 """
-aggregation.py — Token aggregation strategy and feature extraction.
+aggregation.py — Response-only mid-layer pooling for hallucination detection.
 
-Feature vector layout (USE_GEOMETRIC=True):
-  Block A  [0        : 4480]  — mean pool of real tokens across 5 selected layers
-  Block B  [4480     : 4504]  — inter-layer cosine similarity (24 transitions)
-  Block C  [4504     : 4529]  — layer-wise mean L2 norm (25 layers)
-  Block D  [4529     : 4534]  — scalar geometric features (5 values)
-  Total: 4534-d vector
+Feature vector layout (5 blocks × 896 = 4480-d):
+  Block 0: L12 response max-pool  (896)
+  Block 1: L13 response max-pool  (896)
+  Block 2: L13 response mean-pool (896)
+  Block 3: L14 response mean-pool (896)
+  Block 4: L15 response mean-pool (896)
 
-With USE_GEOMETRIC=False only Block A (4480-d) is returned.
+Prompt lengths are pre-tokenised at import time so that solution.py does not
+need to be modified.  A global call counter maps each sequential invocation to
+the correct prompt_len from the pre-computed list.
 """
 
 from __future__ import annotations
 
+import os
+
 import torch
-import torch.nn.functional as F
 
-# Transformer layer indices to use for Block A.
-# Index 0 = token embeddings; 1-24 = transformer layers 1-24.
-# Using all layers: PCA in probe.py finds the most discriminative directions
-# across the full depth trajectory without manual layer selection bias.
-_SELECTED_LAYERS = list(range(25))  # all 25 layers → 25*896 = 22400-d, PCA to 128
+# Mid-layer indices (0 = embeddings, 1-24 = transformer layers for Qwen2.5-0.5B).
+_MAX_POOL_LAYERS  = [12, 13]
+_MEAN_POOL_LAYERS = [13, 14, 15]
+
+# ---------------------------------------------------------------------------
+# Pre-compute prompt token lengths at module import time.
+# Loads dataset.csv then test.csv in the same order that solution.py processes
+# them, so the global call counter maps correctly.
+# ---------------------------------------------------------------------------
+
+_prompt_lens: list[int] = []
+_call_idx: int = 0
 
 
-def aggregate(
-    hidden_states: torch.Tensor,
-    attention_mask: torch.Tensor,
+def _load_prompt_lens() -> list[int]:
+    try:
+        import pandas as pd
+        from transformers import AutoTokenizer
+
+        tok = AutoTokenizer.from_pretrained(
+            "Qwen/Qwen2.5-0.5B-Instruct", trust_remote_code=True
+        )
+        lens: list[int] = []
+        for path in ["./data/dataset.csv", "./data/test.csv"]:
+            if os.path.exists(path):
+                df = pd.read_csv(path)
+                for _, row in df.iterrows():
+                    enc = tok(str(row["prompt"]))
+                    lens.append(len(enc["input_ids"]))
+        return lens
+    except Exception:
+        return []
+
+
+_prompt_lens = _load_prompt_lens()
+
+
+def reset_call_counter() -> None:
+    """Reset the global call counter (useful for testing)."""
+    global _call_idx
+    _call_idx = 0
+
+
+# ---------------------------------------------------------------------------
+# Core aggregation logic
+# ---------------------------------------------------------------------------
+
+
+def _response_mask(
+    real_mask: torch.Tensor,
+    prompt_len: int | None,
 ) -> torch.Tensor:
-    """Block A: last real token across selected transformer layers.
+    """Boolean mask selecting only response tokens.
 
-    Using the last real token rather than mean pool because:
-    - In a decoder-only model the last token attends to the full context
-    - ~60-70% of tokens belong to the (identical) prompt — mean pool is noisy
-    - The final token state captures the model's committed conclusion
-
-    Args:
-        hidden_states:  (n_layers, seq_len, hidden_dim)
-        attention_mask: (seq_len,) — 1 for real tokens, 0 for padding.
-
-    Returns:
-        (len(_SELECTED_LAYERS) * hidden_dim,) = (4480,)
+    Falls back to the full real-token mask when prompt_len is unavailable
+    or would leave zero response tokens.
     """
-    real_positions = attention_mask.nonzero(as_tuple=False)
-    last_pos = int(real_positions[-1].item())
-    parts = []
-    for layer_idx in _SELECTED_LAYERS:
-        parts.append(hidden_states[layer_idx][last_pos])  # (896,)
-    return torch.cat(parts)  # (4480,)
+    if prompt_len is None or prompt_len <= 0:
+        return real_mask
+    seq_len = real_mask.shape[0]
+    start = min(prompt_len, seq_len - 1)
+    resp = real_mask.clone()
+    resp[:start] = False
+    return resp if resp.any() else real_mask
 
 
-def extract_geometric_features(
-    hidden_states: torch.Tensor,
-    attention_mask: torch.Tensor,
-) -> torch.Tensor:
-    """Blocks B, C, D: geometric and statistical features of hidden states.
-
-    Block B (24d): cosine similarity between consecutive layer representations.
-        Low cosine = large representational shift at that layer boundary.
-
-    Block C (25d): mean L2 norm of real-token hidden states per layer.
-        Norms tend to grow through the network; degenerate outputs show
-        anomalous growth patterns.
-
-    Block D (5d): scalar summary statistics of the last-layer activations.
-        norm_mean  — mean token norm in last layer
-        norm_cv    — coefficient of variation (std/mean) of token norms;
-                     low CV signals repetitive/degenerate generation
-        norm_ratio — last-layer mean norm / first-transformer-layer mean norm
-        min_cos    — minimum inter-layer cosine (= point of max drift)
-        n_real     — number of real (non-padding) tokens (length proxy)
-
-    Args:
-        hidden_states:  (n_layers, seq_len, hidden_dim)
-        attention_mask: (seq_len,)
-
-    Returns:
-        (24 + 25 + 5,) = (54,)
-    """
-    real_mask = attention_mask.bool()
-    n_layers = hidden_states.shape[0]  # 25 for Qwen2.5-0.5B
-
-    # Block B: inter-layer cosine similarity (24 values)
-    block_b: list[float] = []
-    for l in range(n_layers - 1):
-        h_l  = hidden_states[l][real_mask].mean(0)      # (hidden_dim,)
-        h_l1 = hidden_states[l + 1][real_mask].mean(0)  # (hidden_dim,)
-        cos  = F.cosine_similarity(h_l.unsqueeze(0), h_l1.unsqueeze(0)).item()
-        block_b.append(cos)
-
-    # Block C: layer-wise mean L2 norm (25 values)
-    block_c: list[float] = [
-        hidden_states[l][real_mask].norm(dim=-1).mean().item()
-        for l in range(n_layers)
-    ]
-
-    # Block D: scalars from last layer (5 values)
-    last        = hidden_states[-1][real_mask]            # (n_real, hidden_dim)
-    token_norms = last.norm(dim=-1)                       # (n_real,)
-
-    norm_mean  = token_norms.mean().item()
-    norm_cv    = (token_norms.std() / (token_norms.mean() + 1e-8)).item()
-    first_norm = hidden_states[1][real_mask].norm(dim=-1).mean().item()
-    norm_ratio = norm_mean / (first_norm + 1e-8)
-    min_cos    = float(min(block_b))
-    n_real     = float(real_mask.sum().item())
-
-    block_d = [norm_mean, norm_cv, norm_ratio, min_cos, n_real]
-
-    return torch.tensor(block_b + block_c + block_d, dtype=torch.float32)
+def _pool(h: torch.Tensor, mask: torch.Tensor, mode: str) -> torch.Tensor:
+    """Max- or mean-pool h[mask] along the token dimension."""
+    tokens = h[mask]  # (n_resp, hidden_dim)
+    if mode == "max":
+        return tokens.max(dim=0).values
+    return tokens.mean(dim=0)
 
 
 def aggregation_and_feature_extraction(
     hidden_states: torch.Tensor,
     attention_mask: torch.Tensor,
     use_geometric: bool = False,
+    prompt_len: int | None = None,
 ) -> torch.Tensor:
-    """Combine Block A with optional geometric features (Blocks B, C, D).
+    """Build a 4480-d feature vector from mid-layer response-only pooling.
 
     Args:
-        hidden_states:  (n_layers, seq_len, hidden_dim)
-        attention_mask: (seq_len,)
-        use_geometric:  If True, append Blocks B+C+D to Block A.
+        hidden_states:  (n_layers, seq_len, hidden_dim) on CPU.
+        attention_mask: (seq_len,) — 1 for real tokens, 0 for padding.
+        use_geometric:  Ignored; kept for interface compatibility with solution.py.
+        prompt_len:     Prompt token count.  When None, looked up from the
+                        module-level pre-computed list via the global counter.
 
     Returns:
-        (4480,) when use_geometric=False, (4534,) when True.
+        1-D float tensor of shape (4480,).
     """
-    hidden_states  = hidden_states.cpu()
-    attention_mask = attention_mask.cpu()
+    global _call_idx
 
-    agg_features = aggregate(hidden_states, attention_mask)
+    hs   = hidden_states.cpu().float()
+    mask = attention_mask.cpu().bool()
 
-    if use_geometric:
-        geo_features = extract_geometric_features(hidden_states, attention_mask)
-        return torch.cat([agg_features, geo_features], dim=0)
+    # Resolve prompt_len from the pre-computed list if not supplied.
+    if prompt_len is None and _call_idx < len(_prompt_lens):
+        prompt_len = _prompt_lens[_call_idx]
+    _call_idx += 1
 
-    return agg_features
+    resp = _response_mask(mask, prompt_len)
 
+    parts: list[torch.Tensor] = []
+    for layer_idx in _MAX_POOL_LAYERS:
+        parts.append(_pool(hs[layer_idx], resp, "max"))
+    for layer_idx in _MEAN_POOL_LAYERS:
+        parts.append(_pool(hs[layer_idx], resp, "mean"))
+
+    return torch.cat(parts)  # (4480,)
+
+
+# ---------------------------------------------------------------------------
+# Legacy entry points — kept for any code that imports them directly.
+# ---------------------------------------------------------------------------
+
+
+def aggregate(
+    hidden_states: torch.Tensor,
+    attention_mask: torch.Tensor,
+    prompt_len: int | None = None,
+) -> torch.Tensor:
+    return aggregation_and_feature_extraction(
+        hidden_states, attention_mask, prompt_len=prompt_len
+    )
+
+
+def extract_geometric_features(
+    hidden_states: torch.Tensor,
+    attention_mask: torch.Tensor,
+) -> torch.Tensor:
+    return torch.empty(0)
