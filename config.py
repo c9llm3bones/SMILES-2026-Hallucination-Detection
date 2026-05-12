@@ -69,6 +69,24 @@ CONFIGS: dict = {
     },
     # ── Ablations (all identical to sol4 except one variable) ─────────────────
 
+    # A0: prompt-only — completes the token-scope trio (prompt / response / all).
+    "sol4_prompt_only": {
+        "aggregation": {
+            "strategy": "response_pool",
+            "max_pool_layers": [12, 13],
+            "mean_pool_layers": [14, 15],
+            "response_only": False,
+            "prompt_only": True,
+        },
+        "probe": {
+            "n_bootstrap": 30,
+            "c_grid": [0.001, 0.002, 0.003, 0.005],
+            "use_pca": False,
+            "pca_components": None,
+            "scale": True,
+        },
+        "splitting": {"n_splits": 5, "n_repeats": 5},
+    },
     # A1: all tokens vs response-only — isolates response_only effect.
     "sol4_all_tokens": {
         "aggregation": {
@@ -172,6 +190,40 @@ CONFIGS: dict = {
             "pca_components": None,
             "scale": True,
             "class_weight": "balanced",
+        },
+        "splitting": {"n_splits": 5, "n_repeats": 5},
+    },
+    # A7: max-pool only — isolates pooling type effect.
+    "sol4_max_only": {
+        "aggregation": {
+            "strategy": "response_pool",
+            "max_pool_layers": [12, 13, 14, 15],
+            "mean_pool_layers": [],
+            "response_only": True,
+        },
+        "probe": {
+            "n_bootstrap": 30,
+            "c_grid": [0.001, 0.002, 0.003, 0.005],
+            "use_pca": False,
+            "pca_components": None,
+            "scale": True,
+        },
+        "splitting": {"n_splits": 5, "n_repeats": 5},
+    },
+    # A8: mean-pool only — isolates pooling type effect.
+    "sol4_mean_only": {
+        "aggregation": {
+            "strategy": "response_pool",
+            "max_pool_layers": [],
+            "mean_pool_layers": [12, 13, 14, 15],
+            "response_only": True,
+        },
+        "probe": {
+            "n_bootstrap": 30,
+            "c_grid": [0.001, 0.002, 0.003, 0.005],
+            "use_pca": False,
+            "pca_components": None,
+            "scale": True,
         },
         "splitting": {"n_splits": 5, "n_repeats": 5},
     },

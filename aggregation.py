@@ -70,6 +70,16 @@ def _response_mask(real_mask: torch.Tensor, prompt_len: int | None) -> torch.Ten
     return resp if resp.any() else real_mask
 
 
+def _prompt_mask(real_mask: torch.Tensor, prompt_len: int | None) -> torch.Tensor:
+    if prompt_len is None or prompt_len <= 0:
+        return real_mask
+    seq_len = real_mask.shape[0]
+    end = min(prompt_len, seq_len)
+    prompt = real_mask.clone()
+    prompt[end:] = False
+    return prompt if prompt.any() else real_mask
+
+
 def _pool(h: torch.Tensor, mask: torch.Tensor, mode: str) -> torch.Tensor:
     tokens = h[mask]
     if mode == "max":
@@ -100,10 +110,15 @@ def aggregation_and_feature_extraction(
         if prompt_len is None and _call_idx < len(_prompt_lens):
             prompt_len = _prompt_lens[_call_idx]
         _call_idx += 1
-        resp = _response_mask(mask, prompt_len) if _AGG.get("response_only", True) else mask
-        for layer_idx in _AGG["max_pool_layers"]:
+        if _AGG.get("prompt_only", False):
+            resp = _prompt_mask(mask, prompt_len)
+        elif _AGG.get("response_only", True):
+            resp = _response_mask(mask, prompt_len)
+        else:
+            resp = mask
+        for layer_idx in _AGG.get("max_pool_layers", []):
             parts.append(_pool(hs[layer_idx], resp, "max"))
-        for layer_idx in _AGG["mean_pool_layers"]:
+        for layer_idx in _AGG.get("mean_pool_layers", []):
             parts.append(_pool(hs[layer_idx], resp, "mean"))
 
     elif strategy == "last_token":
