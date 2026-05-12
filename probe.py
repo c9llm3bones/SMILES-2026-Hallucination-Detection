@@ -72,6 +72,7 @@ class HallucinationProbe(nn.Module):
                     aucs.append(0.5)
             if np.mean(aucs) > best_auc:
                 best_auc, best_c = float(np.mean(aucs)), c
+        print(f"  [probe] selected C={best_c:.4f} (grid={_C_GRID})")
         return best_c
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -93,6 +94,7 @@ class HallucinationProbe(nn.Module):
     def fit_hyperparameters(
         self, X_val: np.ndarray, y_val: np.ndarray
     ) -> "HallucinationProbe":
+        """No-op — required by evaluate.py interface. Threshold is fixed at 0.5."""
         return self
 
     def predict_proba(self, X: np.ndarray) -> np.ndarray:

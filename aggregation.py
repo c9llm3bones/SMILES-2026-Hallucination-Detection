@@ -5,11 +5,15 @@ Strategies (set via config.py):
   mean_pool      mean-pool all real tokens across specified layers
   last_token     last real token across specified layers
   response_pool  response-only max+mean pool (Sol. 4 default)
+
+NOTE: use_geometric is accepted for interface compatibility with solution.py
+but is intentionally ignored — geometric features are not used.
 """
 
 from __future__ import annotations
 
 import os
+import warnings
 
 import torch
 
@@ -19,6 +23,9 @@ _AGG = CFG["aggregation"]
 
 # ---------------------------------------------------------------------------
 # Pre-compute prompt lengths at import time (only needed for response_pool).
+# Loads dataset.csv then test.csv in the same order solution.py processes them.
+# The global counter _call_idx maps sequential invocations to prompt lengths.
+# WARNING: this mapping breaks if aggregation is called in a different order.
 # ---------------------------------------------------------------------------
 
 _prompt_lens: list[int] = []
@@ -26,7 +33,8 @@ _call_idx: int = 0
 
 
 def _load_prompt_lens() -> list[int]:
-    if not _AGG.get("response_only", False):
+    needs_boundary = _AGG.get("response_only", False) or _AGG.get("prompt_only", False)
+    if not needs_boundary:
         return []
     try:
         import pandas as pd
@@ -42,9 +50,15 @@ def _load_prompt_lens() -> list[int]:
                 for _, row in df.iterrows():
                     enc = tok(str(row["prompt"]))
                     lens.append(len(enc["input_ids"]))
+        if not lens:
+            raise RuntimeError("No prompt lengths loaded — data files not found.")
         return lens
-    except Exception:
-        return []
+    except Exception as e:
+        raise RuntimeError(
+            f"aggregation.py: failed to pre-tokenise prompts. "
+            f"Response-only pooling will silently degrade to all-tokens (−9 pp AUROC). "
+            f"Original error: {e}"
+        ) from e
 
 
 _prompt_lens = _load_prompt_lens()
@@ -67,7 +81,15 @@ def _response_mask(real_mask: torch.Tensor, prompt_len: int | None) -> torch.Ten
     start = min(prompt_len, seq_len - 1)
     resp = real_mask.clone()
     resp[:start] = False
-    return resp if resp.any() else real_mask
+    if not resp.any():
+        warnings.warn(
+            f"Response mask is empty after truncation "
+            f"(prompt_len={prompt_len}, seq_len={seq_len}). "
+            "Falling back to full sequence — response-only pooling inactive for this sample.",
+            stacklevel=3,
+        )
+        return real_mask
+    return resp
 
 
 def _prompt_mask(real_mask: torch.Tensor, prompt_len: int | None) -> torch.Tensor:
@@ -77,7 +99,14 @@ def _prompt_mask(real_mask: torch.Tensor, prompt_len: int | None) -> torch.Tenso
     end = min(prompt_len, seq_len)
     prompt = real_mask.clone()
     prompt[end:] = False
-    return prompt if prompt.any() else real_mask
+    if not prompt.any():
+        warnings.warn(
+            f"Prompt mask is empty (prompt_len={prompt_len}, seq_len={seq_len}). "
+            "Falling back to full sequence.",
+            stacklevel=3,
+        )
+        return real_mask
+    return prompt
 
 
 def _pool(h: torch.Tensor, mask: torch.Tensor, mode: str) -> torch.Tensor:
@@ -95,7 +124,7 @@ def _pool(h: torch.Tensor, mask: torch.Tensor, mode: str) -> torch.Tensor:
 def aggregation_and_feature_extraction(
     hidden_states: torch.Tensor,
     attention_mask: torch.Tensor,
-    use_geometric: bool = False,
+    use_geometric: bool = False,  # accepted for compatibility; intentionally unused
     prompt_len: int | None = None,
 ) -> torch.Tensor:
     global _call_idx
@@ -107,15 +136,24 @@ def aggregation_and_feature_extraction(
     strategy = _AGG["strategy"]
 
     if strategy == "response_pool":
-        if prompt_len is None and _call_idx < len(_prompt_lens):
-            prompt_len = _prompt_lens[_call_idx]
+        if prompt_len is None:
+            if _call_idx < len(_prompt_lens):
+                prompt_len = _prompt_lens[_call_idx]
+            else:
+                warnings.warn(
+                    f"_call_idx={_call_idx} exceeds pre-computed prompt_lens "
+                    f"(n={len(_prompt_lens)}). prompt_len=None; falling back to full sequence.",
+                    stacklevel=2,
+                )
         _call_idx += 1
+
         if _AGG.get("prompt_only", False):
             resp = _prompt_mask(mask, prompt_len)
         elif _AGG.get("response_only", True):
             resp = _response_mask(mask, prompt_len)
         else:
             resp = mask
+
         for layer_idx in _AGG.get("max_pool_layers", []):
             parts.append(_pool(hs[layer_idx], resp, "max"))
         for layer_idx in _AGG.get("mean_pool_layers", []):

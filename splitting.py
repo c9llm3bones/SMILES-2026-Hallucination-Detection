@@ -23,7 +23,7 @@ _SPLIT = CFG["splitting"]
 def split_data(
     y: np.ndarray,
     df: pd.DataFrame | None = None,
-    test_size: float = 0.15,
+    test_size: float = 0.15,   # unused — test size is fixed at 1/n_splits by KFold
     val_size: float = 0.15,
     random_state: int = 42,
 ) -> list[tuple[np.ndarray, np.ndarray | None, np.ndarray]]:
