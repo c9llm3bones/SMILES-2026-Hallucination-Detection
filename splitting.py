@@ -1,20 +1,23 @@
 """
-splitting.py — RepeatedStratifiedKFold (5 splits × 5 repeats = 25 folds).
+splitting.py — Train/val/test split strategy controlled by config.py.
 
-25-fold repeated CV gives a stable accuracy estimate that is independent of any
-single lucky seed — a key advantage over single-split or plain 5-fold evaluation.
-
-Split sizes (approximate, for n=689):
-  test  : ~138 samples (20 %, 1/5)
-  val   : ~83  samples (15 % of remaining ~551)
-  train : ~468 samples
+n_repeats=1  → StratifiedKFold (single run)
+n_repeats>1  → RepeatedStratifiedKFold (n_splits × n_repeats folds total)
 """
 
 from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import RepeatedStratifiedKFold, train_test_split
+from sklearn.model_selection import (
+    RepeatedStratifiedKFold,
+    StratifiedKFold,
+    train_test_split,
+)
+
+from config import CFG
+
+_SPLIT = CFG["splitting"]
 
 
 def split_data(
@@ -24,26 +27,24 @@ def split_data(
     val_size: float = 0.15,
     random_state: int = 42,
 ) -> list[tuple[np.ndarray, np.ndarray | None, np.ndarray]]:
-    """25-fold repeated stratified split returning (idx_train, idx_val, idx_test).
+    n_splits  = _SPLIT["n_splits"]
+    n_repeats = _SPLIT["n_repeats"]
 
-    Args:
-        y:            Label array of shape (N,).
-        df:           Unused; kept for interface compatibility.
-        test_size:    Ignored (test size is fixed at 1/n_splits ≈ 20 %).
-        val_size:     Fraction of non-test samples reserved for validation.
-        random_state: Random seed passed to RepeatedStratifiedKFold.
+    idx = np.arange(len(y))
 
-    Returns:
-        List of 25 (idx_train, idx_val, idx_test) tuples.
-    """
-    idx  = np.arange(len(y))
-    rskf = RepeatedStratifiedKFold(
-        n_splits=5, n_repeats=5, random_state=random_state
-    )
+    if n_repeats > 1:
+        kfold = RepeatedStratifiedKFold(
+            n_splits=n_splits, n_repeats=n_repeats, random_state=random_state
+        )
+    else:
+        kfold = StratifiedKFold(
+            n_splits=n_splits, shuffle=True, random_state=random_state
+        )
+
+    relative_val = val_size / (1.0 - 1.0 / n_splits)
     splits = []
 
-    for train_val_idx, test_idx in rskf.split(idx, y):
-        relative_val = val_size / (1.0 - 1.0 / 5)
+    for train_val_idx, test_idx in kfold.split(idx, y):
         train_idx, val_idx = train_test_split(
             train_val_idx,
             test_size=relative_val,
