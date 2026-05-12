@@ -67,7 +67,9 @@ CONFIGS: dict = {
             "n_repeats": 1,
         },
     },
-    # Ablation: same as sol4 but pool over all tokens — isolates effect of response_only.
+    # ── Ablations (all identical to sol4 except one variable) ─────────────────
+
+    # A1: all tokens vs response-only — isolates response_only effect.
     "sol4_all_tokens": {
         "aggregation": {
             "strategy": "response_pool",
@@ -86,6 +88,92 @@ CONFIGS: dict = {
             "n_splits": 5,
             "n_repeats": 5,
         },
+    },
+    # A2: early layers — isolates layer selection effect.
+    "sol4_early_layers": {
+        "aggregation": {
+            "strategy": "response_pool",
+            "max_pool_layers": [4, 5],
+            "mean_pool_layers": [6, 7],
+            "response_only": True,
+        },
+        "probe": {
+            "n_bootstrap": 30,
+            "c_grid": [0.001, 0.002, 0.003, 0.005],
+            "use_pca": False,
+            "pca_components": None,
+            "scale": True,
+        },
+        "splitting": {"n_splits": 5, "n_repeats": 5},
+    },
+    # A3: late layers — isolates layer selection effect.
+    "sol4_late_layers": {
+        "aggregation": {
+            "strategy": "response_pool",
+            "max_pool_layers": [20, 21],
+            "mean_pool_layers": [22, 23],
+            "response_only": True,
+        },
+        "probe": {
+            "n_bootstrap": 30,
+            "c_grid": [0.001, 0.002, 0.003, 0.005],
+            "use_pca": False,
+            "pca_components": None,
+            "scale": True,
+        },
+        "splitting": {"n_splits": 5, "n_repeats": 5},
+    },
+    # A4: with PCA(50) — isolates PCA effect.
+    "sol4_with_pca": {
+        "aggregation": {
+            "strategy": "response_pool",
+            "max_pool_layers": [12, 13],
+            "mean_pool_layers": [14, 15],
+            "response_only": True,
+        },
+        "probe": {
+            "n_bootstrap": 30,
+            "c_grid": [0.001, 0.002, 0.003, 0.005],
+            "use_pca": True,
+            "pca_components": 50,
+            "scale": True,
+        },
+        "splitting": {"n_splits": 5, "n_repeats": 5},
+    },
+    # A5: no bootstrap — isolates bootstrap ensemble effect.
+    "sol4_no_bootstrap": {
+        "aggregation": {
+            "strategy": "response_pool",
+            "max_pool_layers": [12, 13],
+            "mean_pool_layers": [14, 15],
+            "response_only": True,
+        },
+        "probe": {
+            "n_bootstrap": 1,
+            "c_grid": [0.001, 0.002, 0.003, 0.005],
+            "use_pca": False,
+            "pca_components": None,
+            "scale": True,
+        },
+        "splitting": {"n_splits": 5, "n_repeats": 5},
+    },
+    # A6: class_weight='balanced' — isolates class balancing effect.
+    "sol4_balanced": {
+        "aggregation": {
+            "strategy": "response_pool",
+            "max_pool_layers": [12, 13],
+            "mean_pool_layers": [14, 15],
+            "response_only": True,
+        },
+        "probe": {
+            "n_bootstrap": 30,
+            "c_grid": [0.001, 0.002, 0.003, 0.005],
+            "use_pca": False,
+            "pca_components": None,
+            "scale": True,
+            "class_weight": "balanced",
+        },
+        "splitting": {"n_splits": 5, "n_repeats": 5},
     },
     "sol4": {
         "aggregation": {

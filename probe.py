@@ -19,17 +19,19 @@ from sklearn.preprocessing import StandardScaler
 
 from config import CFG
 
-_PROBE       = CFG["probe"]
-_N_BOOTSTRAP = _PROBE["n_bootstrap"]
-_C_GRID      = _PROBE["c_grid"]
-_USE_PCA     = _PROBE["use_pca"]
-_PCA_DIM     = _PROBE.get("pca_components")
-_SCALE       = _PROBE["scale"]
+_PROBE        = CFG["probe"]
+_N_BOOTSTRAP  = _PROBE["n_bootstrap"]
+_C_GRID       = _PROBE["c_grid"]
+_USE_PCA      = _PROBE["use_pca"]
+_PCA_DIM      = _PROBE.get("pca_components")
+_SCALE        = _PROBE["scale"]
+_CLASS_WEIGHT = _PROBE.get("class_weight", None)
 
 
 def _make_lr(C: float) -> LogisticRegression:
     return LogisticRegression(
-        C=C, penalty="l2", solver="lbfgs", max_iter=2000, random_state=42
+        C=C, penalty="l2", solver="lbfgs", max_iter=2000,
+        class_weight=_CLASS_WEIGHT, random_state=42,
     )
 
 
